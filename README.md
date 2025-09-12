@@ -41,7 +41,7 @@ The solutions comprises of the below steps:
 
 1. **Clone the repository**
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/aws-samples/sample-exporting-to-amazon-s3-tables-with-aws-step-functions-distributed-map.git
    cd sample-exporting-to-amazon-s3-tables-with-aws-step-functions-distributed-map
    ```
 
