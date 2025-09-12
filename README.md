@@ -52,9 +52,11 @@ The solutions comprises of the below steps:
    ```
 
 3. **Upload test PDFs**
+
    Upload PDF forms to your S3 bucket under the path: `RawInterestForms/YYYY/WW/`
 
-4. **Trigger processing**
+5. **Trigger processing**
+
    Execute the Step Function manually or wait for the schedule
 
 ## Clean up
