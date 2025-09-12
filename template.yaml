@@ -1,0 +1,415 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Step Functions Form Processor
+
+Parameters:
+  CustomerDataTableBucketName:
+    Type: String
+    Default: all-customer-data
+  FormResponseDatabaseName:
+    Type: String
+    Default: form_responses
+  ParsedFormsTableName:
+    Type: String
+    Default: parsed_forms
+  PutFormDataRoleName:
+    Type: String
+    Default: put_raw_form_data_firehose_role
+  FirehoseErrorBucketNameSuffix:
+    Type: String
+    Default: firehose-errors
+  PutFormDataFireHoseLogGroup:
+    Type: String
+    Default: /aws/kinesisfirehose/put_raw_form_data
+  PutFormDataFireHoseDeliveryLogStream:
+    Type: String
+    Default: destination_delivery
+  PutFormDataFireHoseBackupDeliveryLogStream:
+    Type: String
+    Default: backup_delivery
+  PutFormDataFirehoseName:
+    Type: String
+    Default: put_raw_form_data
+  ETLFormDataStateMachineRoleName:
+    Type: String
+    Default: etl_form_data_sm_role
+  ETLFormDataStateMachineName:
+    Type: String
+    Default: etl_form_data_sm
+  SchedulerInvocationRoleName:
+    Type: String
+    Default: scheduler_invocation_role
+  SchedulerName:
+    Type: String
+    Default: weekly_etl_state_machine_invocation
+  PDFOutputBucket:
+    Type: String
+
+Resources:
+  ParsedFormTableBucket:
+    Type: AWS::S3Tables::TableBucket
+    Properties:
+      TableBucketName: !Ref CustomerDataTableBucketName
+
+  ParsedFormTableDefaultNamespace:
+    Type: AWS::S3Tables::Namespace
+    DependsOn: ParsedFormTableBucket
+    Properties:
+      Namespace: !Ref FormResponseDatabaseName
+      TableBucketARN: !GetAtt ParsedFormTableBucket.TableBucketARN
+
+  RawFormTextTable:
+    Type: AWS::Glue::Table
+    DependsOn: ParsedFormTableDefaultNamespace
+    Properties:
+      CatalogId: !Sub "${AWS::AccountId}:s3tablescatalog/${CustomerDataTableBucketName}"
+      DatabaseName: !Ref FormResponseDatabaseName
+      TableInput:
+        Name: !Ref ParsedFormsTableName
+        Parameters:
+          classification: ""
+          format: ICEBERG
+        StorageDescriptor:
+          Columns:
+            - Name: full_name
+              Type: string
+            - Name: phone_number
+              Type: string
+            - Name: mailing_address
+              Type: string
+            - Name: interest
+              Type: string
+            - Name: processed_date
+              Type: date
+
+  FireHoseErrorBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-${FirehoseErrorBucketNameSuffix}"
+
+  PutRawFormDataFireHoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref PutFormDataRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseS3IcebergTablesAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3TableAccessViaGlueFederation
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:UpdateTable
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*/*
+
+              - Sid: S3DeliveryErrorBucketPermission
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt FireHoseErrorBucket.Arn
+                  - !Sub ${FireHoseErrorBucket.Arn}/*
+
+              - Sid: LakeFormationDataAccess
+                Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: "*"
+
+              - Sid: LoggingInCloudWatch
+                Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${PutFormDataFireHoseLogGroup}:*
+
+  DefaultCatalogLinkedDatabase:
+    Type: AWS::Glue::Database
+    DependsOn: ParsedFormTableDefaultNamespace
+    Properties:
+      CatalogId: !Sub "${AWS::AccountId}"
+      DatabaseInput:
+        Name: !Sub "${FormResponseDatabaseName}_link"
+        TargetDatabase:
+          CatalogId: !Sub "${AWS::AccountId}:s3tablescatalog/${CustomerDataTableBucketName}"
+          DatabaseName: !Ref FormResponseDatabaseName
+      DatabaseName: !Ref FormResponseDatabaseName
+
+  OriginDatabaseGrantToFirehoseRole:
+  OriginDatabaseGrantToFirehoseRole:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - PutRawFormDataFireHoseRole
+      - ParsedFormTableDefaultNamespace
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt PutRawFormDataFireHoseRole.Arn
+      Permissions:
+        - ALTER
+        - INSERT
+        - DESCRIBE
+      Resource:
+        TableResource:
+          CatalogId: !Sub "${AWS::AccountId}:s3tablescatalog/${CustomerDataTableBucketName}"
+          DatabaseName: !Ref FormResponseDatabaseName
+          TableWildcard: {}
+
+  LinkDatabaseGrantToFirehoseRole:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - PutRawFormDataFireHoseRole
+      - DefaultCatalogLinkedDatabase
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt PutRawFormDataFireHoseRole.Arn
+      Permissions:
+        - ALTER
+        - INSERT
+        - DESCRIBE
+      Resource:
+        TableResource:
+          CatalogId: !Sub "${AWS::AccountId}"
+          DatabaseName: !Sub "${FormResponseDatabaseName}_link"
+          TableWildcard: {}
+
+  PutRawFormDataFirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref PutFormDataFireHoseLogGroup
+      RetentionInDays: 14
+
+  PutRawFormDataDestinationDeliveryFirehoseLogStream:
+    DependsOn: PutRawFormDataFirehoseLogGroup
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref PutFormDataFireHoseLogGroup
+      LogStreamName: !Ref PutFormDataFireHoseDeliveryLogStream
+
+  PutRawFormDataBackupDeliveryFirehoseLogStream:
+    DependsOn: PutRawFormDataFirehoseLogGroup
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref PutFormDataFireHoseLogGroup
+      LogStreamName: !Ref PutFormDataFireHoseBackupDeliveryLogStream
+
+  PutRawFormDataFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - OriginDatabaseGrantToFirehoseRole
+      - LinkDatabaseGrantToFirehoseRole
+      - FireHoseErrorBucket
+      - PutRawFormDataDestinationDeliveryFirehoseLogStream
+      - PutRawFormDataBackupDeliveryFirehoseLogStream
+    Properties:
+      DeliveryStreamName: !Ref PutFormDataFirehoseName
+      DeliveryStreamType: DirectPut
+      IcebergDestinationConfiguration:
+        RoleARN: !GetAtt PutRawFormDataFireHoseRole.Arn
+        BufferingHints:
+          IntervalInSeconds: 10
+          SizeInMBs: 5
+        RetryOptions:
+          DurationInSeconds: 300
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref PutFormDataFireHoseLogGroup
+          LogStreamName: !Ref PutFormDataFireHoseDeliveryLogStream
+        S3BackupMode: FailedDataOnly
+        CatalogConfiguration:
+          CatalogARN: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+        DestinationTableConfigurationList:
+          - DestinationTableName: !Ref ParsedFormsTableName
+            DestinationDatabaseName: !Sub "${FormResponseDatabaseName}_link"
+            UniqueKeys:
+              - full_name
+              - phone_number
+              - mailing_address
+              - interest
+              - processed_date
+        S3Configuration:
+          BucketARN: !GetAtt FireHoseErrorBucket.Arn
+          RoleARN: !GetAtt PutRawFormDataFireHoseRole.Arn
+          Prefix: ""
+          ErrorOutputPrefix: !Sub "${PutFormDataFirehoseName}/"
+          CloudWatchLoggingOptions:
+            Enabled: true
+            LogGroupName: !Ref PutFormDataFireHoseLogGroup
+            LogStreamName: !Ref PutFormDataFireHoseBackupDeliveryLogStream
+  ETLFormDataStateMachieRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ETLFormDataStateMachineRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StateMachineServiceIntegrationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - textract:AnalyzeDocument
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  !Sub arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ETLFormDataStateMachineName}/*
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecordBatch
+                Resource:
+                  !GetAtt PutRawFormDataFirehose.Arn
+
+  ETLFormDataStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: PutRawFormDataFirehose
+    Properties:
+      Definition:
+        StartAt: Analyze User Interest Forms
+        States:
+          Analyze User Interest Forms:
+            Type: Map
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: DISTRIBUTED
+                ExecutionType: EXPRESS
+              StartAt: Analyze Interest Form Batch
+              States:
+                Analyze Interest Form Batch:
+                  Type: Map
+                  ItemProcessor:
+                    ProcessorConfig:
+                      Mode: INLINE
+                    StartAt: Extract User Data From Interest Form
+                    States:
+                      Extract User Data From Interest Form:
+                        Type: Task
+                        Arguments:
+                          Document:
+                            S3Object:
+                              Bucket: !Sub "${AWS::AccountId}-raw-forms"
+                              Name: '{% $states.input.Key %}'
+                          FeatureTypes:
+                            - QUERIES
+                          QueriesConfig:
+                            Queries:
+                              - Text: What is the customers name?
+                                Alias: full_name
+                              - Text: What is the customers phone number?
+                                Alias: phone_number
+                              - Text: What is the customers mailing address?
+                                Alias: mailing_address
+                              - Text: What is the customers interest?
+                                Alias: interest
+                        Resource: arn:aws:states:::aws-sdk:textract:analyzeDocument
+                        Assign:
+                          questions: '{% $states.result.Blocks[BlockType=''QUERY''].Query %}'
+                          answers: "{% $states.result.Blocks[BlockType='QUERY_RESULT'].Text %}"
+                        Next: Aggregate Questions and Answers
+                      Aggregate Questions and Answers:
+                        Type: Pass
+                        Output:
+                          data: >-
+                            {% $map($questions, function($v, $i, $a)
+                            {{"question": $questions[$i].Alias, "answer":
+                            $answers[$i]}}) %}
+                        Next: Reduce Questions and Answers
+                      Reduce Questions and Answers:
+                        Type: Pass
+                        Output:
+                          Data: >-
+                            {% $string($merge([$reduce($states.input.data,
+                            function($acc, $v) {$merge([$acc, { ($v.question):
+                            $v.answer }])}, {}), {"processed_date":
+                            $now('[Y0001]-[M01]-[D01]')}])) %}
+                        End: true
+                  Items: '{% $states.input.Items %}'
+                  Next: PutRecordBatch
+                PutRecordBatch:
+                  Type: Task
+                  Arguments:
+                    DeliveryStreamName: !Ref PutFormDataFirehoseName
+                    Records: '{% $states.input %}'
+                  Resource: arn:aws:states:::aws-sdk:firehose:putRecordBatch
+                  End: true
+            End: true
+            Label: AnalyzeUserInterestForms
+            MaxConcurrency: 1
+            ItemReader:
+              Resource: arn:aws:states:::s3:listObjectsV2
+              Arguments:
+                Bucket: !Ref PDFOutputBucket
+                Prefix: '{% ''RawInterestForms/'' & $now(''[Y0001]/[W01]'') %}'
+            ItemBatcher:
+              MaxItemsPerBatch: 10
+            ToleratedFailurePercentage: 10
+        QueryLanguage: JSONata
+      RoleArn: !GetAtt ETLFormDataStateMachieRole.Arn
+      StateMachineName: !Ref ETLFormDataStateMachineName
+      StateMachineType: STANDARD
+      EncryptionConfiguration:
+        Type: AWS_OWNED_KEY
+      LoggingConfiguration:
+        Level: 'OFF'
+        IncludeExecutionData: false
+
+  SchedulerInvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref SchedulerInvocationRoleName
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeStepFunctionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt ETLFormDataStateMachine.Arn
+
+  WeeklyStepFunctionScheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Ref SchedulerName
+      Description: Invoke the Step Function every Sunday at midnight UTC
+      ScheduleExpression: 'cron(0 0 ? * SUN *)'
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt ETLFormDataStateMachine.Arn
+        RoleArn: !GetAtt SchedulerInvocationRole.Arn
+
+
+
