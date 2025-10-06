@@ -2,6 +2,8 @@
 
 This repository showcases a serverless solution that processes PDF fors using AWS Step Functions Distributed Map, extracts data with Amazon Textract, and stores results in Amazon S3 Tables in Iceberg format.
 
+See the accompanying blog post [How to export to Amazon S3 Tables by using AWS Step Functions Distributed Map](https://aws.amazon.com/blogs/compute/how-to-export-to-amazon-s3-tables-by-using-aws-step-functions-distributed-map/) for a detailed description.
+
 ## Overview
 
 The repository demonstrates how to:
